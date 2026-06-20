@@ -12,11 +12,14 @@ import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.io.IOException
+import java.io.InputStream
+import java.io.PushbackInputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.URI
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -84,7 +87,7 @@ class Socks5ProxyService : Service() {
                     reuseAddress = true
                     bind(InetSocketAddress(host, port))
                 }
-                log("پروکسی SOCKS5 روی $host:$port شروع به کار کرد")
+                log("پروکسی روی $host:$port شروع به کار کرد (SOCKS5 + HTTP)")
                 statusCallback?.invoke("running:$host:$port")
 
                 while (running.get()) {
@@ -135,21 +138,30 @@ class Socks5ProxyService : Service() {
         return "0.0.0.0"
     }
 
-    // ── Client handler ────────────────────────────────────────────────────────
+    // ── Client handler (تشخیص خودکار SOCKS5 یا HTTP) ────────────────────────────
 
     private fun handleClient(client: Socket) {
         totalConnections.incrementAndGet()
         activeConnections.incrementAndGet()
         try {
             client.soTimeout = 15_000
-            if (!doHandshake(client)) return
+            val input = PushbackInputStream(client.getInputStream(), 1)
 
-            val (cmd, destIp, destPort) = parseRequest(client) ?: return
+            val first = input.read()
+            if (first < 0) return
+            input.unread(first)
 
-            if (cmd == 0x01) {
-                handleTcpConnect(client, destIp, destPort)
+            if (first == 0x05) {
+                // ── مسیر SOCKS5 ──
+                if (!doHandshake(client, input)) return
+                val (cmd, destIp, destPort) = parseRequest(input) ?: return
+                if (cmd == 0x01) {
+                    handleTcpConnect(client, input, destIp, destPort)
+                }
+            } else {
+                // ── مسیر HTTP / HTTP CONNECT (برای PS5 و سایر کنسول‌ها) ──
+                handleHttpProxy(client, input)
             }
-            // UDP ASSOCIATE (0x03) — اندروید معمولاً UDP را سیستمی مدیریت می‌کند
         } catch (e: Exception) {
             Log.d(TAG, "خطای کلاینت: ${e.message}")
         } finally {
@@ -160,14 +172,13 @@ class Socks5ProxyService : Service() {
 
     // ── SOCKS5 handshake ──────────────────────────────────────────────────────
 
-    private fun doHandshake(sock: Socket): Boolean {
-        val input = sock.getInputStream()
+    private fun doHandshake(sock: Socket, input: InputStream): Boolean {
         val output = sock.getOutputStream()
 
         val hdr = readExact(input, 2) ?: return false
         if (hdr[0] != 0x05.toByte()) return false
 
-        val methods = readExact(input, hdr[1].toInt() and 0xFF) ?: return false
+        readExact(input, hdr[1].toInt() and 0xFF) ?: return false
         output.write(byteArrayOf(0x05, 0x00)) // no auth
         return true
     }
@@ -176,8 +187,7 @@ class Socks5ProxyService : Service() {
 
     private data class Request(val cmd: Int, val destIp: String, val destPort: Int)
 
-    private fun parseRequest(sock: Socket): Request? {
-        val input = sock.getInputStream()
+    private fun parseRequest(input: InputStream): Request? {
         val hdr = readExact(input, 4) ?: return null
         if (hdr[0] != 0x05.toByte()) return null
 
@@ -205,9 +215,9 @@ class Socks5ProxyService : Service() {
         return Request(cmd, destIp, destPort)
     }
 
-    // ── TCP CONNECT relay ─────────────────────────────────────────────────────
+    // ── TCP CONNECT relay (SOCKS5) ────────────────────────────────────────────
 
-    private fun handleTcpConnect(client: Socket, destIp: String, destPort: Int) {
+    private fun handleTcpConnect(client: Socket, input: InputStream, destIp: String, destPort: Int) {
         val output = client.getOutputStream()
         val remote: Socket
         try {
@@ -220,15 +230,13 @@ class Socks5ProxyService : Service() {
             return
         }
 
-        // Success reply
         val ipBytes = InetAddress.getByName(destIp).address
         output.write(byteArrayOf(0x05, 0x00, 0x00, 0x01) + ipBytes +
                 byteArrayOf((destPort shr 8).toByte(), destPort.toByte()))
 
-        // Relay both directions
         val done = AtomicBoolean(false)
-        val t1 = Thread { relay(client.getInputStream(), remote.getOutputStream(), done) }
-        val t2 = Thread { relay(remote.getInputStream(), client.getOutputStream(), done) }
+        val t1 = Thread { relay(input, remote.getOutputStream(), done) }
+        val t2 = Thread { relay(remote.getInputStream(), output, done) }
         t1.isDaemon = true; t2.isDaemon = true
         t1.start(); t2.start()
         t1.join(SELECT_TIMEOUT.toLong())
@@ -236,7 +244,94 @@ class Socks5ProxyService : Service() {
         try { remote.close() } catch (_: Exception) {}
     }
 
-    private fun relay(input: java.io.InputStream, output: java.io.OutputStream, done: AtomicBoolean) {
+    // ── HTTP / HTTP CONNECT proxy (برای کنسول‌هایی مثل PS5) ──────────────────
+
+    private fun handleHttpProxy(client: Socket, input: InputStream) {
+        val output = client.getOutputStream()
+
+        val requestLine = readLine(input) ?: return
+        val parts = requestLine.split(" ")
+        if (parts.size < 3) return
+        val method = parts[0]
+        val target = parts[1]
+
+        val headers = mutableListOf<String>()
+        var hostHeader: String? = null
+        while (true) {
+            val line = readLine(input) ?: break
+            if (line.isEmpty()) break
+            headers.add(line)
+            if (line.startsWith("Host:", ignoreCase = true)) {
+                hostHeader = line.substringAfter(":").trim()
+            }
+        }
+
+        val destHost: String
+        val destPort: Int
+
+        if (method.equals("CONNECT", ignoreCase = true)) {
+            val hp = target.split(":")
+            destHost = hp[0]
+            destPort = hp.getOrNull(1)?.toIntOrNull() ?: 443
+        } else if (target.startsWith("http://", true) || target.startsWith("https://", true)) {
+            val uri = URI(target)
+            destHost = uri.host ?: return
+            destPort = if (uri.port != -1) uri.port else 80
+        } else if (hostHeader != null) {
+            val hp = hostHeader!!.split(":")
+            destHost = hp[0]
+            destPort = hp.getOrNull(1)?.toIntOrNull() ?: 80
+        } else {
+            return
+        }
+
+        val remote: Socket
+        try {
+            remote = Socket()
+            remote.connect(InetSocketAddress(destHost, destPort), 15_000)
+            remote.tcpNoDelay = true
+            client.tcpNoDelay = true
+        } catch (e: Exception) {
+            output.write("HTTP/1.1 502 Bad Gateway\r\n\r\n".toByteArray())
+            return
+        }
+
+        if (method.equals("CONNECT", ignoreCase = true)) {
+            output.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
+        } else {
+            val sb = StringBuilder()
+            sb.append(requestLine).append("\r\n")
+            for (h in headers) sb.append(h).append("\r\n")
+            sb.append("\r\n")
+            remote.getOutputStream().write(sb.toString().toByteArray())
+        }
+
+        val done = AtomicBoolean(false)
+        val t1 = Thread { relay(input, remote.getOutputStream(), done) }
+        val t2 = Thread { relay(remote.getInputStream(), output, done) }
+        t1.isDaemon = true; t2.isDaemon = true
+        t1.start(); t2.start()
+        t1.join(SELECT_TIMEOUT.toLong())
+        done.set(true)
+        try { remote.close() } catch (_: Exception) {}
+    }
+
+    private fun readLine(input: InputStream): String? {
+        val sb = StringBuilder()
+        var any = false
+        while (true) {
+            val c = input.read()
+            if (c < 0) return if (any) sb.toString() else null
+            any = true
+            if (c == '\n'.code) {
+                if (sb.isNotEmpty() && sb.last() == '\r') sb.setLength(sb.length - 1)
+                return sb.toString()
+            }
+            sb.append(c.toChar())
+        }
+    }
+
+    private fun relay(input: InputStream, output: java.io.OutputStream, done: AtomicBoolean) {
         val buf = ByteArray(TCP_BUF)
         try {
             while (!done.get()) {
@@ -249,7 +344,7 @@ class Socks5ProxyService : Service() {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private fun readExact(input: java.io.InputStream, n: Int): ByteArray? {
+    private fun readExact(input: InputStream, n: Int): ByteArray? {
         if (n <= 0) return ByteArray(0)
         val buf = ByteArray(n)
         var offset = 0
@@ -273,7 +368,7 @@ class Socks5ProxyService : Service() {
             val channel = NotificationChannel(
                 CHANNEL_ID, "NatProxy Service",
                 NotificationManager.IMPORTANCE_LOW
-            ).apply { description = "پروکسی SOCKS5 در حال اجرا" }
+            ).apply { description = "پروکسی SOCKS5 / HTTP در حال اجرا" }
             getSystemService(NotificationManager::class.java)
                 .createNotificationChannel(channel)
         }
