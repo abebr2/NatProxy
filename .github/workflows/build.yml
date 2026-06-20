@@ -17,17 +17,20 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.2'
+
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Make gradlew executable
-        run: chmod +x gradlew
-
-      - name: Build Debug APK
-        run: ./gradlew assembleDebug
+      - name: Build APK
+        run: gradle assembleDebug
+        working-directory: .
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: NatProxy-debug
+          name: NatProxy-APK
           path: app/build/outputs/apk/debug/app-debug.apk
